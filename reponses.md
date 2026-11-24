@@ -141,6 +141,8 @@ HTTP/1.1 500 Internal Server Error
 
 Le binding lu à l'étape 2 est un binding **SOAP 1.1** (namespace `http://schemas.xmlsoap.org/wsdl/soap/`, transport `.../soap/http`). L'endpoint n'accepte donc que des enveloppes dans le namespace `http://schemas.xmlsoap.org/soap/envelope/`. La version SOAP est identifiée **uniquement par le namespace de l'enveloppe**. En recevant le namespace 1.2, le serveur répond par la Fault standard `VersionMismatch`, rédigée elle-même en SOAP 1.1 (sa seule version connue).
 
+Remarque : ce résultat est obtenu en gardant `Content-Type: text/xml` (comme le demande l'énoncé). Si on envoie le message avec le Content-Type propre à SOAP 1.2, `application/soap+xml; charset=utf-8`, le serveur le refuse dès la couche HTTP : **HTTP 415 Unsupported Media Type**, sans corps ni Fault, car l'endpoint SOAP 1.1 n'accepte que `text/xml` et ne lit même pas l'enveloppe.
+
 ### Q4. Les cinq erreurs du dernier message et leur correction
 
 | # | Erreur | Correction |
@@ -160,8 +162,8 @@ En corrigeant **une erreur à la fois**, voici ce que le serveur a renvoyé :
 | 1, 2, 3, 4, 5 | 500, `Client` : `envelope` au lieu de `Envelope` |
 | 2, 3, 4, 5 | 500, `Client` : « Méthode de répartition introuvable pour {http://supnum.mr/bibliotheque}rendreLivre » |
 | 2, 3, 5 | même Fault (namespace) |
-| 3, 5 | **200 OK**, `penalite = 0` |
-| 3 seule | **200 OK**, `penalite = 0` |
+| 3, 5 | avant l'étape 4 : **200 OK**, `penalite = 0` · avec le code final : 500, `Client` : « Numéro d'emprunt inconnu : null » |
+| 3 seule | avant l'étape 4 : **200 OK**, `penalite = 0` · avec le code final : 500, `Client` : « Numéro d'emprunt inconnu : null » |
 | 5 seule | **200 OK**, `penalite = 0` |
 | 4 seule | 500, `Server` : `jakarta.xml.bind.UnmarshalException` |
 
