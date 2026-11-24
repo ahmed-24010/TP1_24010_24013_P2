@@ -1,0 +1,5 @@
+target/
+*.zip
+.claude/
+.github/modernize/
+*.log
