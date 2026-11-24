@@ -241,3 +241,359 @@ Validée avec un parseur XML (Python `xml.dom.minidom`, équivalent de `xmllint 
 | Éléments enfants | non qualifiés (`faultcode`, `faultstring`) | tous qualifiés (`soap:Code`, `soap:Reason`…) |
 | Code HTTP associé | toujours 500 | 400 pour `Sender`, 500 pour `Receiver` |
 | Content-Type | `text/xml` | `application/soap+xml` |
+
+---
+
+# Partie B — Contract-first
+
+> Projet `emprunt-contractfirst`. Le serveur de la partie A est arrêté (les deux utilisent le port 8080).
+> Partie B exécutée sous Linux (JDK 17.0.21, Maven 3.9.12, Metro 4.0.2), avec `curl` et `xmllint`.
+
+## Étape 5 — Générer le code depuis le WSDL
+
+Le projet reprend le `pom.xml` de la partie A avec `artifactId = emprunt-contractfirst`,
+`mainClass = mr.supnum.bib.impl.Serveur`, plus le plugin `jaxws-maven-plugin:4.0.2` (goal `wsimport`).
+Le contrat est enregistré dans `src/main/resources/wsdl/EmpruntService.wsdl`.
+
+```
+mvn generate-sources   →  BUILD SUCCESS
+[INFO] jaxws:wsimport args: [-keep, -s, target/generated-sources/wsimport, -d, target/classes,
+       -encoding, UTF-8, -Xnocompile, -p, mr.supnum.bib.contrat,
+       -wsdllocation, /wsdl/EmpruntService.wsdl, file:.../src/main/resources/wsdl/EmpruntService.wsdl]
+```
+
+Classes générées dans `target/generated-sources/wsimport/mr/supnum/bib/contrat/` :
+
+| Fichier | Origine dans le WSDL |
+|---|---|
+| `EmpruntPortType.java` | `<wsdl:portType name="EmpruntPortType">` (interface, SEI) |
+| `EmpruntService.java` | `<wsdl:service name="EmpruntService">` (classe cliente `Service`) |
+| `EmprunterLivre.java` / `EmprunterLivreResponse.java` | éléments `emprunterLivre` / `emprunterLivreResponse` (wrappers) |
+| `EmpruntType.java` | `<xs:complexType name="EmpruntType">` |
+| `LivreIndisponible.java` | élément `<xs:element name="LivreIndisponible">` (le *fault bean*) |
+| `LivreIndisponibleFault.java` | `<wsdl:message name="LivreIndisponibleFault">` (l'exception) |
+| `ObjectFactory.java`, `package-info.java` | plomberie JAXB |
+
+`package-info.java` contient une ligne décisive pour la suite :
+
+```java
+@jakarta.xml.bind.annotation.XmlSchema(namespace = "http://supnum.mr/bib",
+        elementFormDefault = jakarta.xml.bind.annotation.XmlNsForm.QUALIFIED)
+```
+
+C'est la traduction de `elementFormDefault="qualified"` du schéma : **ici, les paramètres doivent être
+qualifiés** (préfixe `bib:`), contrairement à la partie A.
+
+### Q1. L'opération, son message de fault et l'action SOAP
+
+- **Opération** : `emprunterLivre`, déclarée dans `<wsdl:portType name="EmpruntPortType">`, avec
+  `<wsdl:input message="bib:emprunterLivreRequest"/>`, `<wsdl:output message="bib:emprunterLivreResponse"/>`
+  et `<wsdl:fault name="LivreIndisponible" message="bib:LivreIndisponibleFault"/>`.
+  (Ce contrat ne décrit **qu'une** opération : `rendreLivre` n'existe pas en partie B.)
+- **Message de fault** : `<wsdl:message name="LivreIndisponibleFault">` avec une seule part
+  `<wsdl:part name="fault" element="bib:LivreIndisponible"/>`, c'est-à-dire l'élément XSD
+  `LivreIndisponible` (`isbn` + `retourPrevu`). C'est lui qui remplira le `<detail>` de la Fault.
+- **Action SOAP** : `<soap:operation soapAction="http://supnum.mr/bib/emprunterLivre"/>` dans le
+  `binding`. C'est la valeur à envoyer dans l'en-tête HTTP `SOAPAction`. En partie A, JAX-WS avait
+  généré `soapAction=""`.
+
+### Q2. Signature de `emprunterLivre` dans `EmpruntPortType`
+
+```java
+@WebService(name = "EmpruntPortType", targetNamespace = "http://supnum.mr/bib")
+public interface EmpruntPortType {
+
+    @WebMethod(action = "http://supnum.mr/bib/emprunterLivre")
+    @WebResult(name = "emprunt", targetNamespace = "http://supnum.mr/bib")
+    @RequestWrapper(localName = "emprunterLivre",  targetNamespace = "http://supnum.mr/bib",
+                    className = "mr.supnum.bib.contrat.EmprunterLivre")
+    @ResponseWrapper(localName = "emprunterLivreResponse", targetNamespace = "http://supnum.mr/bib",
+                     className = "mr.supnum.bib.contrat.EmprunterLivreResponse")
+    public EmpruntType emprunterLivre(
+        @WebParam(name = "idAdherent", targetNamespace = "http://supnum.mr/bib") String idAdherent,
+        @WebParam(name = "isbn",       targetNamespace = "http://supnum.mr/bib") String isbn)
+        throws LivreIndisponibleFault;
+}
+```
+
+En une ligne : `EmpruntType emprunterLivre(String idAdherent, String isbn) throws LivreIndisponibleFault`.
+
+Deux remarques :
+
+- wsimport a **déballé** (*unwrapped*) l'élément `emprunterLivre` : la méthode prend directement les
+  deux paramètres au lieu d'un objet `EmprunterLivre`. C'est le mode *document/literal wrapped*,
+  possible parce que l'élément est un `complexType` anonyme contenant une seule `xs:sequence` sans attribut.
+- `isbn` est un simple `String` : le `xs:simpleType IsbnType` (une restriction de `xs:string`)
+  **ne produit aucune classe Java**. La contrainte `xs:pattern` est donc présente dans le contrat
+  mais **absente du code généré** — elle ne sera vérifiée qu'avec `@SchemaValidation` (étape 6, Q3).
+
+### Q3. Type Java généré pour `dateRetour` — comparaison avec la partie A
+
+Dans `EmpruntType.java` :
+
+```java
+@XmlElement(required = true)
+@XmlSchemaType(name = "date")
+protected XMLGregorianCalendar dateRetour;
+```
+
+| | Partie A (code-first) | Partie B (contract-first) |
+|---|---|---|
+| Champ Java | `public String dateRetour` (écrit à la main) | `XMLGregorianCalendar dateRetour` (généré) |
+| Type XSD | `xs:string`, `minOccurs="0"` | `xs:date`, `required = true` |
+| Vérification | aucune : `"pas une date"` passerait | le parseur refuse une valeur qui n'est pas une date |
+
+C'est le sens du contract-first : le contrat impose `xs:date`, et JAXB choisit le type Java
+standard correspondant (`XMLGregorianCalendar`, le seul type JAXB capable de représenter une date XML
+sans fuseau). D'où la méthode utilitaire `date(LocalDate)` dans l'implémentation.
+En partie A, le contrat n'était qu'un reflet appauvri du code (`String` → `xs:string`).
+
+### Q4. Nom de la classe d'exception générée et son origine dans le WSDL
+
+La classe générée est **`LivreIndisponibleFault`** :
+
+```java
+@WebFault(name = "LivreIndisponible", targetNamespace = "http://supnum.mr/bib")
+public class LivreIndisponibleFault extends Exception {
+    private LivreIndisponible faultInfo;
+    public LivreIndisponibleFault(String message, LivreIndisponible faultInfo) { ... }
+    public LivreIndisponible getFaultInfo() { return faultInfo; }
+}
+```
+
+Trois noms différents cohabitent, et il faut bien voir d'où vient chacun :
+
+| Nom Java | Vient de | Dans le WSDL |
+|---|---|---|
+| **`LivreIndisponibleFault`** (classe d'exception) | le nom du **message** de fault | `<wsdl:message name="LivreIndisponibleFault">` |
+| `LivreIndisponible` (le *fault bean*, contenu du `<detail>`) | le nom de l'**élément** référencé par la part | `<wsdl:part name="fault" element="bib:LivreIndisponible"/>` |
+| `@WebFault(name = "LivreIndisponible")` | le même élément | idem |
+
+Le nom de la classe ne vient donc **pas** de `<wsdl:fault name="LivreIndisponible">` du `portType`,
+mais bien du `wsdl:message`. C'est exactement l'inverse de la partie A, où c'est le code Java
+(`LivreIndisponibleException` + `@WebFault(name="LivreIndisponible")`) qui avait fixé les noms du WSDL.
+
+---
+
+## Étape 6 — Implémenter et comparer
+
+`EmpruntServiceImpl` implémente `EmpruntPortType` ; `Serveur` publie `new EmpruntServiceImpl()` sur la
+même URL. Lancement : `mvn clean compile exec:java` → `WSDL : http://localhost:8080/bib/EmpruntService?wsdl`.
+
+Fichiers de test ajoutés dans `xml/` (versions « partie B » de `01-emprunter.xml`) :
+
+| Fichier | Contenu |
+|---|---|
+| `09-emprunter-cf.xml` | ISBN valide `978-2-07-036822-8`, paramètres **qualifiés** `bib:` |
+| `10-indisponible-cf.xml` | ISBN `978-2-10-074444-4` |
+| `11-isbn-invalide-cf.xml` | ISBN `978-2-10` (format invalide) |
+
+Commande type :
+
+```bash
+curl -i -X POST http://localhost:8080/bib/EmpruntService \
+  -H 'Content-Type: text/xml; charset=utf-8' \
+  -H 'SOAPAction: "http://supnum.mr/bib/emprunterLivre"' \
+  --data-binary @xml/09-emprunter-cf.xml
+```
+
+Résultats observés :
+
+| # | Message envoyé | `@SchemaValidation` | HTTP | Réponse |
+|---|---|---|---|---|
+| 1 | `01-emprunter.xml` (tel quel, non qualifié) | non | 500 | Fault `S:Server` : `Cannot invoke "String.equals(Object)" because "isbn" is null` |
+| 2 | `09-emprunter-cf.xml` | non | 200 | `emprunterLivreResponse` : `numero = E-2026-0812`, `dateRetour = 2026-12-08` |
+| 3 | `09-emprunter-cf.xml`, `SOAPAction: ""` | non | 200 | même réponse |
+| 4 | `10-indisponible-cf.xml` | non | 500 | Fault `S:Server` `Livre indisponible` + `<detail>` |
+| 5 | `11-isbn-invalide-cf.xml` | non | **200** | emprunt accepté malgré l'ISBN invalide |
+| 6 | `11-isbn-invalide-cf.xml` | **oui** | 500 | Fault `S:Client` : `cvc-pattern-valid: Value '978-2-10' is not facet-valid … for type 'IsbnType'` |
+| 7 | `01-emprunter.xml` (non qualifié) | **oui** | 500 | Fault `S:Client` : `cvc-complex-type.2.4.a: Invalid content was found starting with element 'idAdherent'. One of '{"http://supnum.mr/bib":idAdherent}' is expected.` |
+
+### Q1. Le WSDL publié est-il celui que nous avons fourni ?
+
+**Oui, à l'octet près.** La comparaison (`diff`) entre `?wsdl` et
+`src/main/resources/wsdl/EmpruntService.wsdl` ne montre aucune différence de contenu : seuls la
+déclaration `<?xml …?>` et un commentaire ajoutés par Metro diffèrent
+
+```xml
+<!-- Published by XML-WS Runtime … Runtime's version is XML-WS Runtime 4.0.2 … -->
+```
+
+Notre indentation, nos préfixes (`wsdl:`, `bib:`), nos noms (`EmpruntPortType`, `EmpruntSoapBinding`)
+sont conservés. C'est l'effet de `wsdlLocation = "wsdl/EmpruntService.wsdl"` : Metro **sert le fichier
+du classpath** au lieu d'en générer un.
+
+Il contient bien :
+
+```xml
+<xs:simpleType name="IsbnType">
+  <xs:restriction base="xs:string">
+    <xs:pattern value="97[89]-\d-\d{2,5}-\d{2,6}-\d"/>
+  </xs:restriction>
+</xs:simpleType>
+...
+<xs:element name="dateRetour" type="xs:date"/>
+```
+
+→ **le motif de l'ISBN et le type `xs:date` sont présents**, tous deux absents du WSDL de la partie A.
+Le contrat est ici la source, pas une conséquence.
+
+### Q2. A-t-il fallu modifier `01-emprunter.xml` ? Pourquoi ?
+
+**Oui.** Envoyé tel quel (test n° 1), le message donne une Fault `S:Server` :
+`Cannot invoke "String.equals(Object)" because "isbn" is null`. Les paramètres n'ont pas été lus.
+
+La cause est le schéma : celui de la partie B déclare `elementFormDefault="qualified"` (repris dans
+`package-info.java`), alors que celui généré en partie A ne le déclarait pas, donc `unqualified`.
+Les éléments **locaux** `idAdherent` et `isbn` appartiennent donc ici au namespace
+`http://supnum.mr/bib` et doivent porter le préfixe :
+
+```xml
+<bib:emprunterLivre>
+  <bib:idAdherent>A-117</bib:idAdherent>     <!-- partie A : <idAdherent> -->
+  <bib:isbn>978-2-07-036822-8</bib:isbn>     <!-- partie A : <isbn>      -->
+</bib:emprunterLivre>
+```
+
+C'est `xml/09-emprunter-cf.xml` → **HTTP 200**. Le même message SOAP ne marche donc pas sur les deux
+services : le contrat, pas seulement l'URL, fait partie de l'interface.
+
+À noter aussi (test n° 7) : sans `@SchemaValidation`, l'erreur se manifeste par un
+`NullPointerException` déguisé en Fault `Server`, c'est-à-dire **tard et mal** ; avec validation, le
+serveur répond une Fault `Client` qui nomme précisément l'élément attendu.
+
+Deux autres points qui **n'ont pas** nécessité de modification :
+
+- **L'en-tête `SOAPAction`** : le contrat déclare
+  `soapAction="http://supnum.mr/bib/emprunterLivre"`, et c'est la valeur correcte à envoyer. Mais le
+  test n° 3 montre que Metro répond **200 même avec `SOAPAction: ""`** : il aiguille sur le nom de
+  l'élément du Body, pas sur l'en-tête. Une pile plus stricte (ou un routage par `SOAPAction`, fréquent
+  côté .NET ou sur un ESB) refuserait le message ; on envoie donc toujours la valeur du binding.
+- **Le bloc `<bib:jeton>` du Header** : toujours ignoré, car sans `mustUnderstand="1"` (cf. étape 4, Q4).
+
+### Q3. Sans `@SchemaValidation`, l'ISBN `978-2-10` est-il refusé ? Et avec ?
+
+- **Sans** (test n° 5) : **non, il est accepté** → HTTP 200, un emprunt `E-2026-0812` est créé pour un
+  ISBN invalide. JAXB ne vérifie **pas** les facettes (`xs:pattern`, `xs:minLength`…) lors du
+  *unmarshalling* : il mappe `IsbnType` sur un `String` et ne regarde que la structure. La contrainte
+  est écrite dans le contrat, mais **personne ne l'applique**.
+- **Avec** `@com.sun.xml.ws.developer.SchemaValidation` (test n° 6) : **oui, refusé** →
+
+  ```xml
+  HTTP/1.1 500 Internal Server Error
+  <faultcode>S:Client</faultcode>
+  <faultstring>org.xml.sax.SAXParseException; cvc-pattern-valid: Value '978-2-10' is not
+  facet-valid with respect to pattern '97[89]-\d-\d{2,5}-\d{2,6}-\d' for type 'IsbnType'.</faultstring>
+  ```
+
+  L'annotation (extension Metro) branche un validateur XSD sur le flux entrant : le message est
+  contrôlé contre le schéma du WSDL **avant** d'atteindre notre code, et le faultcode est correctement
+  `Client`, sans qu'on ait écrit une ligne de vérification.
+
+**Comparaison avec la partie A** : la même erreur y était détectée par un `Pattern` Java écrit à la main
+dans `EmpruntService`, invisible dans le contrat. Ici, la règle est **écrite une seule fois, dans le
+WSDL**, et appliquée automatiquement — mais seulement si on pense à activer la validation : par défaut,
+un service contract-first est aussi permissif qu'un service code-first.
+
+### Q4. Si on retire `wsdlLocation` de l'annotation
+
+Metro ne trouve plus de contrat à servir : il **régénère** le WSDL à partir des classes compilées, comme
+en partie A. Le WSDL publié change profondément :
+
+| | Avec `wsdlLocation` | Sans `wsdlLocation` |
+|---|---|---|
+| Source | notre fichier, servi tel quel | régénéré par Metro au démarrage |
+| `types` | schéma **en ligne** dans le WSDL | `<xsd:import schemaLocation="…?xsd=1"/>` |
+| `IsbnType` / `xs:pattern` | présents | **disparus** : `<xs:element name="isbn" type="xs:string"/>` |
+| `dateRetour` | `xs:date` | `xs:date` (conservé : `XMLGregorianCalendar` + `@XmlSchemaType(name="date")`) |
+| Nom du binding | `EmpruntSoapBinding` | `EmpruntPortBinding` |
+| Nom du fault (portType/binding) | `LivreIndisponible` | `LivreIndisponibleFault` |
+| WS-Addressing | absent | attributs `wsam:Action="…"` ajoutés sur input/output/fault |
+| Préfixes / mise en forme | les nôtres (`wsdl:`, `bib:`) | ceux de Metro (`tns:`, défaut) |
+
+La conséquence la plus grave est silencieuse : **la contrainte d'ISBN disparaît du contrat**, donc
+`@SchemaValidation` n'a plus de motif à vérifier. Vérifié :
+`11-isbn-invalide-cf.xml` (ISBN `978-2-10`), validation activée, sans `wsdlLocation` → **HTTP 200**,
+emprunt accepté. Le service reste « contract-first » dans son code, mais il ne publie plus le contrat
+qu'il est censé honorer, et deux clients compilés à deux moments différents ne voient plus les mêmes
+règles.
+
+`wsdlLocation` est donc indispensable : c'est lui qui garantit que **le contrat publié est bien celui
+qui a servi à générer le code**. Il a été remis dans le code rendu.
+
+---
+
+## Conclusion — Choisir et rendre
+
+### Q1. Deux différences observées entre le WSDL de la partie A et celui de la partie B
+
+Les deux principales :
+
+1. **La richesse du schéma.** Partie A : `isbn` et `dateRetour` sont des `xs:string` avec
+   `minOccurs="0"`, sans aucune contrainte — la règle de format de l'ISBN reste enfermée dans le code
+   Java. Partie B : `isbn` est un `IsbnType` avec `xs:pattern`, `dateRetour` est un `xs:date`, et les
+   éléments sont obligatoires. Le contrat de la partie B **dit vraiment** ce que le service attend ;
+   celui de la partie A est plus faible que son implémentation.
+2. **La qualification des éléments et le `soapAction`.** Partie A : schéma sans `elementFormDefault`
+   (donc `unqualified`, paramètres sans préfixe) et `soapAction=""`. Partie B :
+   `elementFormDefault="qualified"` (paramètres en `bib:`) et
+   `soapAction="http://supnum.mr/bib/emprunterLivre"`. Les messages SOAP des deux parties ne sont pas
+   interchangeables (cf. étape 6, Q2).
+
+Autres différences relevées : la partie A décrit deux opérations (`emprunterLivre`, `rendreLivre`), la
+partie B une seule ; la partie A met le schéma dans un `?xsd=1` séparé, la partie B en ligne ; les noms
+diffèrent (`portType EmpruntService` / `EmpruntPortBinding` contre `EmpruntPortType` /
+`EmpruntSoapBinding`), ce qui suffirait déjà à casser un client généré sur l'autre WSDL.
+
+### Q2. Si on renomme le champ `dateRetour` dans le code
+
+C'est **le projet code-first (partie A)** qui voit son contrat changer : le WSDL étant produit à partir
+des annotations, renommer `dateRetour` en `dateEcheance` suffit à publier, au prochain démarrage, un
+schéma différent — **sans aucune erreur de compilation, sans avertissement, sans changement de version**.
+
+Le risque pour les clients : tous ceux qui ont généré leur souche sur l'ancien WSDL cherchent toujours
+`<dateRetour>`. En *document/literal*, un élément inconnu est **ignoré** par JAXB (constaté à l'étape 3,
+erreur n° 3) : le champ vaut `null` côté client, sans la moindre Fault. La panne est **silencieuse** et
+ne se voit qu'au moment où la date est affichée ou utilisée. C'est une rupture de contrat non détectée.
+
+En partie B, le contrat est un fichier versionné : renommer un champ de l'implémentation ne change rien
+au WSDL, et renommer un élément du WSDL **casse la compilation** de l'implémentation au prochain
+`mvn generate-sources` — l'erreur est visible immédiatement, au bon endroit.
+
+### Q3. Quelle approche pour le service Paiement ? Et pour un prototype de deux jours ?
+
+**Service Paiement (Scolarité .NET, Bibliothèque PHP, portail Node.js) → contract-first, sans hésiter.**
+
+- Le contrat est partagé par trois équipes, trois langages et trois calendriers : il doit être un
+  **artefact versionné**, négocié avant le code et figé, pas la conséquence d'une classe Java que
+  n'importe quel refactoring peut modifier (cf. Q2).
+- L'interopérabilité l'exige : avec le code-first, `elementFormDefault`, les `minOccurs`, les types et
+  les noms dépendent de la pile Java. Un WSDL écrit à la main reste neutre et lisible par
+  `wsdl.exe` (.NET), `wsdl2php` ou `strong-soap` (Node.js).
+- Les règles métier (format d'un montant, d'une devise, d'une référence de paiement) sont exprimées
+  en XSD et **vérifiées par chaque pile**, au lieu d'être réécrites trois fois.
+- Les équipes peuvent travailler **en parallèle** dès que le WSDL est publié : chacune génère ses
+  souches et développe contre un bouchon, sans attendre le serveur.
+
+**Prototype interne de deux jours → code-first.** Écrire le WSDL à la main coûterait plus cher que le
+prototype lui-même ; un seul consommateur, qu'on contrôle, et un contrat qu'on peut casser sans
+prévenir. La règle à respecter est celle de l'énoncé : **figer le WSDL avant la mise en production**
+(`?wsdl` enregistré dans le dépôt, puis repris en contract-first), sinon le prototype devient un
+service public dont le contrat change à chaque refactoring.
+
+---
+
+## Rendu
+
+Arborescence finale :
+
+```
+TP1_24010_24013_P2/
+├── emprunt-codefirst/          (partie A)
+├── emprunt-contractfirst/      (partie B)
+│   ├── pom.xml
+│   ├── src/main/resources/wsdl/EmpruntService.wsdl
+│   └── src/main/java/mr/supnum/bib/impl/{EmpruntServiceImpl,Serveur}.java
+├── xml/                        (01 à 11)
+└── reponses.md
+```
